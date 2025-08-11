@@ -61,7 +61,7 @@ public class CalendarController {
         }
     }
 
-    @PostMapping("/sendInvite")
+    @PostMapping("/sendInviteV1")
     public String sendCalendarInvite(@RequestParam String hostEmail, @RequestParam String attendeeEmail) {
         try {
             Calendar calendarService = GoogleCalendarService.getCalendarService();
