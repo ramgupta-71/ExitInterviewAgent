@@ -42,7 +42,7 @@ public class GoogleCalendarService {
     private static final String TOKENS_DIRECTORY_PATH = "tokens";
 
     private static final List<String> SCOPES = Arrays.asList(CalendarScopes.CALENDAR, GmailScopes.GMAIL_SEND);
-    private static final String CREDENTIALS_FILE_PATH = "/credentials.json";
+    private static final String CREDENTIALS_FILE_PATH = "credentials.json";
     static int callbackPort = Integer.parseInt(System.getenv().getOrDefault("OAUTH_CALLBACK_PORT", "8888"));
 
 
