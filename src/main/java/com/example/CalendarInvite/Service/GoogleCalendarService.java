@@ -125,6 +125,43 @@ public class GoogleCalendarService {
         System.out.printf("Event created: %s\n", createdEvent.getHtmlLink());
     }
 
+    public void createMeetingEventV2(Calendar calendarService, String hostEmail, List<String> attendeeEmails,
+                                   ZonedDateTime startTime, ZonedDateTime endTime, String zoomLink, String aiText) throws Exception {
+
+        Event event = new Event()
+                .setSummary("Meeting")
+                .setLocation("Online")
+                .setDescription(aiText + "\nZoom link: " + zoomLink);
+
+        EventDateTime start = new EventDateTime()
+                .setDateTime(new com.google.api.client.util.DateTime(startTime.toInstant().toEpochMilli()))
+                .setTimeZone(startTime.getZone().toString());
+        event.setStart(start);
+
+        EventDateTime end = new EventDateTime()
+                .setDateTime(new com.google.api.client.util.DateTime(endTime.toInstant().toEpochMilli()))
+                .setTimeZone(endTime.getZone().toString());
+        event.setEnd(end);
+
+        // Combine host + attendees into one list
+        List<EventAttendee> attendees = new ArrayList<>();
+        attendees.add(new EventAttendee().setEmail(hostEmail));
+
+        for (String email : attendeeEmails) {
+            attendees.add(new EventAttendee().setEmail(email));
+        }
+
+        event.setAttendees(attendees);
+
+        Event createdEvent = calendarService.events()
+                .insert("primary", event)
+                .setSendUpdates("all") // sends invites by email
+                .execute();
+
+        System.out.printf("Event created: %s\n", createdEvent.getHtmlLink());
+    }
+
+
 
     public String getFreeBusy(@RequestParam String email) throws Exception {
         Calendar service = GoogleCalendarService.getCalendarService();

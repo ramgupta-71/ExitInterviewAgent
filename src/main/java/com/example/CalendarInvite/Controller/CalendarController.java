@@ -193,5 +193,58 @@ public class CalendarController {
         }
     }
 
+    @PostMapping("/sendInvite2")
+    public String createGoogleCalEventV2(
+            @RequestParam String hostEmail,
+            @RequestParam List<String> attendeeEmails, // accept multiple
+            @RequestParam String prompt) {
+        try {
+            // Include host + all attendees
+            List<String> emails = new ArrayList<>();
+            emails.add(hostEmail);
+            emails.addAll(attendeeEmails);
+
+            // Find common free time
+            String startTimeStr = findCommonFreeTime(emails);
+            if (startTimeStr.startsWith("No common free time")) {
+                return startTimeStr;
+            }
+
+            ZonedDateTime startTime = ZonedDateTime.parse(startTimeStr);
+            ZonedDateTime endTime = startTime.plusHours(1);
+
+            // Create Zoom meeting
+            ZoomMeetingService zoomService = new ZoomMeetingService();
+            ZoomMeetingService.MeetingDetails meetingDetails =
+                    zoomService.createMeeting(startTimeStr, "Meeting with attendees");
+            String zoomJoinUrl = meetingDetails.getJoinUrl();
+
+            // Calendar service
+            Calendar calendarService = GoogleCalendarService.getCalendarService();
+            String AiText = String.valueOf(generateResponse(prompt));
+
+            // Pass the list of attendees to your calendar creation method
+            googleCalendarService.createMeetingEventV2(
+                    calendarService,
+                    hostEmail,
+                    attendeeEmails,  // list instead of single email
+                    startTime,
+                    endTime,
+                    zoomJoinUrl,
+                    AiText
+            );
+
+            return "Invite sent to " + String.join(", ", emails) + " starting at " + startTimeStr;
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            return "Failed to send invite: " + e.getMessage();
+        }
+    }
+
+
+
+
+
 
 }
