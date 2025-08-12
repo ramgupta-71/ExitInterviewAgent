@@ -12,30 +12,42 @@ import com.google.api.client.json.gson.GsonFactory;
 import com.google.api.client.util.store.FileDataStoreFactory;
 import com.google.api.services.calendar.Calendar;
 import com.google.api.services.calendar.CalendarScopes;
-import com.google.api.services.calendar.model.Event;
-import com.google.api.services.calendar.model.EventAttendee;
-import com.google.api.services.calendar.model.EventDateTime;
+import com.google.api.services.calendar.model.*;
 import com.google.api.services.gmail.Gmail;
 import com.google.api.services.gmail.GmailScopes;
 import com.google.api.services.gmail.model.Message;
 import org.springframework.stereotype.Service;
+import org.springframework.web.bind.annotation.RequestParam;
+
+import com.google.auth.oauth2.GoogleCredentials;
+import com.google.auth.oauth2.AccessToken;
+import com.google.auth.oauth2.ServiceAccountCredentials;
+
+import com.google.genai.Client;
+import com.google.genai.types.GenerateContentResponse;
+
+
+
+
+
+import java.io.*;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.List;
+import java.util.Arrays;
 
 
 import javax.mail.Session;
 import javax.mail.internet.InternetAddress;
 import javax.mail.internet.MimeMessage;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.nio.file.Paths;
-import java.util.Arrays;
-import java.util.Base64;
-import java.util.List;
-import java.util.Properties;
+import java.time.ZonedDateTime;
+import java.util.*;
 
 @Service
 public class GoogleCalendarService {
+
+
 
     private static final String APPLICATION_NAME = "CalendarInviteApp";
     private static final JsonFactory JSON_FACTORY = GsonFactory.getDefaultInstance();
@@ -83,20 +95,21 @@ public class GoogleCalendarService {
                 .build();
     }
 
-    public void createMeetingEvent(Calendar calendarService, String hostEmail, String attendeeEmail) throws Exception {
+    public void createMeetingEvent(Calendar calendarService, String hostEmail, String attendeeEmail,
+                                   ZonedDateTime startTime, ZonedDateTime endTime, String zoomLink,String AiText) throws Exception {
         Event event = new Event()
                 .setSummary("Meeting")
                 .setLocation("Online")
-                .setDescription("Scheduled meeting between host and attendee.");
+                .setDescription(AiText+"\nZoom link: " + zoomLink);
 
         EventDateTime start = new EventDateTime()
-                .setDateTime(new com.google.api.client.util.DateTime("2025-08-12T10:00:00-05:00"))
-                .setTimeZone("America/Chicago");
+                .setDateTime(new com.google.api.client.util.DateTime(startTime.toInstant().toEpochMilli()))
+                .setTimeZone(startTime.getZone().toString());
         event.setStart(start);
 
         EventDateTime end = new EventDateTime()
-                .setDateTime(new com.google.api.client.util.DateTime("2025-08-12T11:00:00-05:00"))
-                .setTimeZone("America/Chicago");
+                .setDateTime(new com.google.api.client.util.DateTime(endTime.toInstant().toEpochMilli()))
+                .setTimeZone(endTime.getZone().toString());
         event.setEnd(end);
 
         event.setAttendees(Arrays.asList(
@@ -111,6 +124,34 @@ public class GoogleCalendarService {
 
         System.out.printf("Event created: %s\n", createdEvent.getHtmlLink());
     }
+
+
+    public String getFreeBusy(@RequestParam String email) throws Exception {
+        Calendar service = GoogleCalendarService.getCalendarService();
+
+        FreeBusyRequest freeBusyRequest = new FreeBusyRequest();
+        freeBusyRequest.setTimeMin(new com.google.api.client.util.DateTime(System.currentTimeMillis()));
+        freeBusyRequest.setTimeMax(new com.google.api.client.util.DateTime(System.currentTimeMillis() + 7 * 24 * 60 * 60 * 1000)); // 1 week ahead
+        freeBusyRequest.setItems(Collections.singletonList(new FreeBusyRequestItem().setId(email)));
+
+        FreeBusyResponse freeBusyResponse = service.freebusy().query(freeBusyRequest).execute();
+
+        var busyTimes = freeBusyResponse.getCalendars().get(email).getBusy();
+
+        if (busyTimes.isEmpty()) {
+            return "User " + email + " is free for the entire time range.";
+        }
+
+        StringBuilder sb = new StringBuilder("User " + email + " busy times:\n");
+        busyTimes.forEach(timeRange -> {
+            sb.append("From: ").append(timeRange.getStart())
+                    .append(" To: ").append(timeRange.getEnd())
+                    .append("\n");
+        });
+
+        return sb.toString();
+    }
+
 
 
     private void sendEmail(Gmail service, String from, String to, String subject, String bodyText) throws IOException {

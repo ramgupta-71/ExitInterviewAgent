@@ -116,6 +116,14 @@ public class ZoomMeetingService {
 
 
     public static class MeetingDetails {
+        public String getJoinUrl() {
+            return joinUrl;
+        }
+
+        public String getMeetingId() {
+            return meetingId;
+        }
+
         public final String joinUrl;
         public final String meetingId;
 

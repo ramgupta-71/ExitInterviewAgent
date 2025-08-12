@@ -3,14 +3,18 @@ package com.example.CalendarInvite.Controller;
 import com.example.CalendarInvite.Service.GoogleCalendarService;
 import com.example.CalendarInvite.Service.ZoomMeetingService;
 import com.google.api.services.calendar.Calendar;
-import com.google.api.services.calendar.model.FreeBusyRequest;
-import com.google.api.services.calendar.model.FreeBusyRequestItem;
-import com.google.api.services.calendar.model.FreeBusyResponse;
-import com.google.api.services.gmail.Gmail;
+import com.google.api.services.calendar.model.*;
+import com.google.genai.Client;
+import com.google.genai.types.GenerateContentResponse;
+import org.jspecify.annotations.Nullable;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.Collections;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.util.*;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api/calendar")
@@ -49,6 +53,59 @@ public class CalendarController {
         return sb.toString();
     }
 
+    @PostMapping("/findCommonFreeTime")
+    public String findCommonFreeTime(@RequestParam List<String> emails) throws Exception {
+        Calendar service = GoogleCalendarService.getCalendarService();
+
+        // Define working hours range for search
+        ZonedDateTime now = ZonedDateTime.now(ZoneId.of("America/Chicago"));
+        ZonedDateTime startOfSearch = now.withHour(9).withMinute(0).withSecond(0);
+        ZonedDateTime endOfSearch = now.withHour(17).withMinute(0).withSecond(0);
+
+        FreeBusyRequest freeBusyRequest = new FreeBusyRequest()
+                .setTimeMin(new com.google.api.client.util.DateTime(startOfSearch.toInstant().toEpochMilli()))
+                .setTimeMax(new com.google.api.client.util.DateTime(endOfSearch.plusDays(7).toInstant().toEpochMilli())) // 7 days search window
+                .setItems(emails.stream()
+                        .map(email -> new FreeBusyRequestItem().setId(email))
+                        .collect(Collectors.toList()));
+
+        FreeBusyResponse freeBusyResponse = service.freebusy().query(freeBusyRequest).execute();
+
+        // Convert Map<String, FreeBusyCalendar> to Map<String, List<TimePeriod>>
+        Map<String, List<TimePeriod>> busyTimesMap = new HashMap<>();
+        for (Map.Entry<String, FreeBusyCalendar> entry : freeBusyResponse.getCalendars().entrySet()) {
+            busyTimesMap.put(entry.getKey(), entry.getValue().getBusy());
+        }
+        List<TimePeriod> mergedBusyTimes = busyTimesMap.values().stream()
+                .flatMap(List::stream)
+                .sorted(Comparator.comparing(tp -> tp.getStart().getValue()))
+                .toList();
+
+        // Find first free slot within 9–5
+        ZonedDateTime currentTime = startOfSearch;
+        for (TimePeriod busy : mergedBusyTimes) {
+            ZonedDateTime busyStart = ZonedDateTime.parse(busy.getStart().toStringRfc3339());
+            ZonedDateTime busyEnd = ZonedDateTime.parse(busy.getEnd().toStringRfc3339());
+
+            if (currentTime.plusMinutes(30).isBefore(busyStart)) {
+                // Found a gap of at least 30 minutes — return just the start time
+                return currentTime.toString();
+            }
+
+            if (busyEnd.isAfter(currentTime)) {
+                currentTime = busyEnd;
+            }
+        }
+
+        // Check if free time is available at the end of the day
+        if (currentTime.plusMinutes(30).isBefore(endOfSearch)) {
+            return currentTime.toString();
+        }
+
+        return "No common free time found within working hours.";
+    }
+
+
     @PostMapping("/zoom/create")
     public Object createZoomMeeting(@RequestParam String startTime, @RequestParam String topic) {
         try {
@@ -66,7 +123,7 @@ public class CalendarController {
         try {
             Calendar calendarService = GoogleCalendarService.getCalendarService();
 
-            googleCalendarService.createMeetingEvent(calendarService, hostEmail, attendeeEmail);
+            //googleCalendarService.createMeetingEvent(calendarService, hostEmail, attendeeEmail);
 
             return "Invite sent to " + hostEmail + " and " + attendeeEmail;
         } catch (Exception e) {
@@ -74,19 +131,67 @@ public class CalendarController {
             return "Failed to send invite: " + e.getMessage();
         }
     }
+
+
+    @Value("${GOOGLE_API_KEY}")
+    private String googleApiKey;
+
+
+
+
+    @PostMapping("/generate")
+    public @Nullable String generateResponse(@RequestBody String prompt) {
+            Client client = Client.builder().apiKey(googleApiKey).build();
+
+            GenerateContentResponse response = client.models.generateContent(
+                    "gemini-2.5-flash",
+                    prompt,
+                    null
+            );
+
+            return response.text();
+    }
+
 
     @PostMapping("/sendInvite")
-    public String createGoogleCalEvent(@RequestParam String hostEmail, @RequestParam String attendeeEmail) {
+    public String createGoogleCalEvent(@RequestParam String hostEmail, @RequestParam String attendeeEmail, @RequestParam String prompt) {
         try {
+            // List of emails for finding common free time
+            List<String> emails = Arrays.asList(hostEmail, attendeeEmail);
+
+            // Call findCommonFreeTime and get the start time string (ISO-8601)
+            String startTimeStr = findCommonFreeTime(emails);
+
+            if (startTimeStr.startsWith("No common free time")) {
+                return startTimeStr; // no free slot found
+            }
+
+            // Parse start time string to ZonedDateTime
+            ZonedDateTime startTime = ZonedDateTime.parse(startTimeStr);
+
+            // Calculate end time as start + 1 hour
+            ZonedDateTime endTime = startTime.plusHours(1);
+
+            // Create Zoom meeting with start time and a topic (e.g., "Meeting with attendeeEmail")
+            ZoomMeetingService zoomService = new ZoomMeetingService();
+            ZoomMeetingService.MeetingDetails meetingDetails = zoomService.createMeeting(startTimeStr, "Meeting with " + attendeeEmail);
+
+            // Get Zoom join URL from meeting details
+            String zoomJoinUrl = meetingDetails.getJoinUrl();
+
             Calendar calendarService = GoogleCalendarService.getCalendarService();
 
-            googleCalendarService.createMeetingEvent(calendarService, hostEmail, attendeeEmail);
+            String AiText= String.valueOf(generateResponse(prompt));
 
-            return "Invite sent to " + hostEmail + " and " + attendeeEmail;
+            // Pass Zoom join URL to calendar event description
+            googleCalendarService.createMeetingEvent(calendarService, hostEmail, attendeeEmail, startTime, endTime, zoomJoinUrl,AiText);
+
+            return "Invite sent to " + hostEmail + " and " + attendeeEmail + " starting at " + startTimeStr;
         } catch (Exception e) {
             e.printStackTrace();
             return "Failed to send invite: " + e.getMessage();
         }
     }
+
 
 }
