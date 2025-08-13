@@ -129,7 +129,7 @@ public class GoogleCalendarService {
                                    ZonedDateTime startTime, ZonedDateTime endTime, String zoomLink, String aiText) throws Exception {
 
         Event event = new Event()
-                .setSummary("Meeting")
+                .setSummary("Exit Interview")
                 .setLocation("Online")
                 .setDescription(aiText + "\nZoom link: " + zoomLink);
 

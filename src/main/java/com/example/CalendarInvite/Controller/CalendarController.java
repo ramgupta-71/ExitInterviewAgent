@@ -9,10 +9,14 @@ import com.google.genai.types.GenerateContentResponse;
 import org.jspecify.annotations.Nullable;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.LocalDate;
+import java.time.LocalTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -54,56 +58,123 @@ public class CalendarController {
     }
 
     @PostMapping("/findCommonFreeTime")
-    public String findCommonFreeTime(@RequestParam List<String> emails) throws Exception {
+    public String findCommonFreeTime(
+            @RequestParam List<String> emails,
+            @RequestParam String lastDayOfWork // e.g. "08/12/2025" or "2025-08-12"
+    ) throws Exception {
         Calendar service = GoogleCalendarService.getCalendarService();
 
-        // Define working hours range for search
-        ZonedDateTime now = ZonedDateTime.now(ZoneId.of("America/Chicago"));
-        ZonedDateTime startOfSearch = now.withHour(9).withMinute(0).withSecond(0);
-        ZonedDateTime endOfSearch = now.withHour(17).withMinute(0).withSecond(0);
+        // ---- Config ----
+        ZoneId tz = ZoneId.of("America/Chicago");
+        LocalTime workStart = LocalTime.of(9, 0);
+        LocalTime workEnd   = LocalTime.of(17, 0);
+        int minMinutes = 30;
 
+        // ---- Parse last day of work ----
+        LocalDate lastDay;
+        try {
+            // Accept both MM/dd/yyyy and ISO yyyy-MM-dd
+            DateTimeFormatter mdy = DateTimeFormatter.ofPattern("MM/dd/yyyy");
+            if (lastDayOfWork.contains("/")) lastDay = LocalDate.parse(lastDayOfWork, mdy);
+            else lastDay = LocalDate.parse(lastDayOfWork); // ISO
+        } catch (Exception ex) {
+            return "Invalid lastDayOfWork format. Use MM/dd/yyyy or yyyy-MM-dd.";
+        }
+
+        // ---- Build search window: [tomorrow 9:00, min(tomorrow+7d 17:00, lastDay 17:00)] ----
+        ZonedDateTime now = ZonedDateTime.now(tz);
+        ZonedDateTime startOfWindow = now.plusDays(1).withHour(workStart.getHour()).withMinute(workStart.getMinute()).withSecond(0).withNano(0);
+        ZonedDateTime sevenDayCap = startOfWindow.plusDays(7).withHour(workEnd.getHour()).withMinute(workEnd.getMinute()).withSecond(0).withNano(0);
+        ZonedDateTime lastDayEnd = lastDay.atTime(workEnd).atZone(tz);
+        ZonedDateTime endOfWindow = sevenDayCap.isBefore(lastDayEnd) ? sevenDayCap : lastDayEnd;
+
+        if (!startOfWindow.isBefore(endOfWindow)) {
+            return "No common free time between tomorrow and the last day of work.";
+        }
+
+        // ---- Free/Busy query over the window ----
         FreeBusyRequest freeBusyRequest = new FreeBusyRequest()
-                .setTimeMin(new com.google.api.client.util.DateTime(startOfSearch.toInstant().toEpochMilli()))
-                .setTimeMax(new com.google.api.client.util.DateTime(endOfSearch.plusDays(7).toInstant().toEpochMilli())) // 7 days search window
+                .setTimeMin(new com.google.api.client.util.DateTime(startOfWindow.toInstant().toEpochMilli()))
+                .setTimeMax(new com.google.api.client.util.DateTime(endOfWindow.toInstant().toEpochMilli()))
                 .setItems(emails.stream()
                         .map(email -> new FreeBusyRequestItem().setId(email))
                         .collect(Collectors.toList()));
 
         FreeBusyResponse freeBusyResponse = service.freebusy().query(freeBusyRequest).execute();
 
-        // Convert Map<String, FreeBusyCalendar> to Map<String, List<TimePeriod>>
-        Map<String, List<TimePeriod>> busyTimesMap = new HashMap<>();
-        for (Map.Entry<String, FreeBusyCalendar> entry : freeBusyResponse.getCalendars().entrySet()) {
-            busyTimesMap.put(entry.getKey(), entry.getValue().getBusy());
-        }
-        List<TimePeriod> mergedBusyTimes = busyTimesMap.values().stream()
-                .flatMap(List::stream)
+        // ---- Merge, normalize and sort busy periods ----
+        List<TimePeriod> mergedBusyTimes = freeBusyResponse.getCalendars().entrySet().stream()
+                .flatMap(e -> {
+                    List<TimePeriod> b = e.getValue().getBusy();
+                    return (b == null ? Collections.<TimePeriod>emptyList() : b).stream();
+                })
                 .sorted(Comparator.comparing(tp -> tp.getStart().getValue()))
-                .toList();
+                .collect(Collectors.toList());
 
-        // Find first free slot within 9–5
-        ZonedDateTime currentTime = startOfSearch;
+        // Helper: clamp a time to business hours for its day
+        java.util.function.UnaryOperator<ZonedDateTime> clampToWorkHours = (zdt) -> {
+            LocalTime lt = zdt.toLocalTime();
+            if (lt.isBefore(workStart)) {
+                return zdt.withHour(workStart.getHour()).withMinute(workStart.getMinute()).withSecond(0).withNano(0);
+            }
+            if (!lt.isBefore(workEnd)) {
+                // at/after 5pm -> next day 9am
+                return zdt.plusDays(1).withHour(workStart.getHour()).withMinute(workStart.getMinute()).withSecond(0).withNano(0);
+            }
+            return zdt.withSecond(0).withNano(0);
+        };
+
+        ZonedDateTime currentTime = clampToWorkHours.apply(startOfWindow);
+
         for (TimePeriod busy : mergedBusyTimes) {
-            ZonedDateTime busyStart = ZonedDateTime.parse(busy.getStart().toStringRfc3339());
-            ZonedDateTime busyEnd = ZonedDateTime.parse(busy.getEnd().toStringRfc3339());
+            ZonedDateTime busyStart = ZonedDateTime.parse(busy.getStart().toStringRfc3339()).withZoneSameInstant(tz);
+            ZonedDateTime busyEnd   = ZonedDateTime.parse(busy.getEnd().toStringRfc3339()).withZoneSameInstant(tz);
 
-            if (currentTime.plusMinutes(30).isBefore(busyStart)) {
-                // Found a gap of at least 30 minutes — return just the start time
-                return currentTime.toString();
+            // Ignore busy blocks outside our window
+            if (busyEnd.isBefore(startOfWindow)) continue;
+            if (busyStart.isAfter(endOfWindow)) break;
+
+            // Check for a gap before this busy block
+            ZonedDateTime endOfWorkToday = currentTime.withHour(workEnd.getHour()).withMinute(workEnd.getMinute()).withSecond(0).withNano(0);
+            ZonedDateTime candidateEnd = currentTime.plusMinutes(minMinutes);
+
+            if (candidateEnd.isBefore(busyStart)
+                    && !candidateEnd.isAfter(endOfWorkToday)
+                    && !candidateEnd.isAfter(endOfWindow)) {
+                return currentTime.toString(); // ISO-8601
             }
 
+            // Advance currentTime past this busy block if needed
             if (busyEnd.isAfter(currentTime)) {
                 currentTime = busyEnd;
             }
+
+            // If past business hours, move to next day 9am
+            if (!currentTime.toLocalTime().isBefore(workEnd)) {
+                currentTime = currentTime.plusDays(1)
+                        .withHour(workStart.getHour()).withMinute(workStart.getMinute()).withSecond(0).withNano(0);
+            }
+
+            // If we advanced before 9am, clamp up to 9am
+            currentTime = clampToWorkHours.apply(currentTime);
+
+            // If we rolled beyond the window, stop
+            if (!currentTime.isBefore(endOfWindow)) break;
         }
 
-        // Check if free time is available at the end of the day
-        if (currentTime.plusMinutes(30).isBefore(endOfSearch)) {
-            return currentTime.toString();
+        // Tail check after the last busy block within window
+        currentTime = clampToWorkHours.apply(currentTime);
+        if (currentTime.isBefore(endOfWindow)) {
+            ZonedDateTime endOfWorkToday = currentTime.withHour(workEnd.getHour()).withMinute(workEnd.getMinute()).withSecond(0).withNano(0);
+            ZonedDateTime candidateEnd = currentTime.plusMinutes(minMinutes);
+            if (!candidateEnd.isAfter(endOfWorkToday) && !candidateEnd.isAfter(endOfWindow)) {
+                return currentTime.toString();
+            }
         }
 
-        return "No common free time found within working hours.";
+        return "No common free time found between tomorrow and the last day of work within working hours.";
     }
+
 
 
     @PostMapping("/zoom/create")
@@ -153,59 +224,62 @@ public class CalendarController {
     }
 
 
-    @PostMapping("/sendInvite")
-    public String createGoogleCalEvent(@RequestParam String hostEmail, @RequestParam String attendeeEmail, @RequestParam String prompt) {
-        try {
-            // List of emails for finding common free time
-            List<String> emails = Arrays.asList(hostEmail, attendeeEmail);
-
-            // Call findCommonFreeTime and get the start time string (ISO-8601)
-            String startTimeStr = findCommonFreeTime(emails);
-
-            if (startTimeStr.startsWith("No common free time")) {
-                return startTimeStr; // no free slot found
-            }
-
-            // Parse start time string to ZonedDateTime
-            ZonedDateTime startTime = ZonedDateTime.parse(startTimeStr);
-
-            // Calculate end time as start + 1 hour
-            ZonedDateTime endTime = startTime.plusHours(1);
-
-            // Create Zoom meeting with start time and a topic (e.g., "Meeting with attendeeEmail")
-            ZoomMeetingService zoomService = new ZoomMeetingService();
-            ZoomMeetingService.MeetingDetails meetingDetails = zoomService.createMeeting(startTimeStr, "Meeting with " + attendeeEmail);
-
-            // Get Zoom join URL from meeting details
-            String zoomJoinUrl = meetingDetails.getJoinUrl();
-
-            Calendar calendarService = GoogleCalendarService.getCalendarService();
-
-            String AiText= String.valueOf(generateResponse(prompt));
-
-            // Pass Zoom join URL to calendar event description
-            googleCalendarService.createMeetingEvent(calendarService, hostEmail, attendeeEmail, startTime, endTime, zoomJoinUrl,AiText);
-
-            return "Invite sent to " + hostEmail + " and " + attendeeEmail + " starting at " + startTimeStr;
-        } catch (Exception e) {
-            e.printStackTrace();
-            return "Failed to send invite: " + e.getMessage();
-        }
-    }
+//    @PostMapping("/sendInvite")
+//    public String createGoogleCalEvent(@RequestParam String hostEmail, @RequestParam String attendeeEmail, @RequestParam String prompt) {
+//        try {
+//            // List of emails for finding common free time
+//            List<String> emails = Arrays.asList(hostEmail, attendeeEmail);
+//
+//            // Call findCommonFreeTime and get the start time string (ISO-8601)
+//            // startTimeStr = findCommonFreeTime(emails);
+//
+//            if (startTimeStr.startsWith("No common free time")) {
+//                return startTimeStr; // no free slot found
+//            }
+//
+//            // Parse start time string to ZonedDateTime
+//            ZonedDateTime startTime = ZonedDateTime.parse(startTimeStr);
+//
+//            // Calculate end time as start + 1 hour
+//            ZonedDateTime endTime = startTime.plusHours(1);
+//
+//            // Create Zoom meeting with start time and a topic (e.g., "Meeting with attendeeEmail")
+//            ZoomMeetingService zoomService = new ZoomMeetingService();
+//            ZoomMeetingService.MeetingDetails meetingDetails = zoomService.createMeeting(startTimeStr, "Meeting with " + attendeeEmail);
+//
+//            // Get Zoom join URL from meeting details
+//            String zoomJoinUrl = meetingDetails.getJoinUrl();
+//
+//            Calendar calendarService = GoogleCalendarService.getCalendarService();
+//
+//            String AiText= String.valueOf(generateResponse(prompt));
+//
+//            // Pass Zoom join URL to calendar event description
+//            googleCalendarService.createMeetingEvent(calendarService, hostEmail, attendeeEmail, startTime, endTime, zoomJoinUrl,AiText);
+//
+//            return "Invite sent to " + hostEmail + " and " + attendeeEmail + " starting at " + startTimeStr;
+//        } catch (Exception e) {
+//            e.printStackTrace();
+//            return "Failed to send invite: " + e.getMessage();
+//        }
+//    }
 
     @PostMapping("/sendInvite2")
     public String createGoogleCalEventV2(
             @RequestParam String hostEmail,
             @RequestParam List<String> attendeeEmails, // accept multiple
-            @RequestParam String prompt) {
+            @RequestParam String prompt,
+            @RequestParam @DateTimeFormat(pattern = "MM/dd/yyyy") LocalDate lastDayOfWork    ) {
         try {
             // Include host + all attendees
             List<String> emails = new ArrayList<>();
             emails.add(hostEmail);
             emails.addAll(attendeeEmails);
 
-            // Find common free time
-            String startTimeStr = findCommonFreeTime(emails);
+            // Parse last day of work into a date or ZonedDateTime
+
+            // Pass last day into your method
+            String startTimeStr = findCommonFreeTime(emails, String.valueOf(lastDayOfWork));
             if (startTimeStr.startsWith("No common free time")) {
                 return startTimeStr;
             }
@@ -241,7 +315,6 @@ public class CalendarController {
             return "Failed to send invite: " + e.getMessage();
         }
     }
-
 
 
 
